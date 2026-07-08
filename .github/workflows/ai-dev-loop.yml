@@ -1,0 +1,372 @@
+name: AI Dev Loop
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: Issue number to implement.
+        required: true
+        type: string
+      trigger_comment:
+        description: Comment text that triggered the loop.
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        description: Branch to create the AI work branch from.
+        required: false
+        type: string
+        default: main
+      branch_prefix:
+        description: Prefix for the fixed issue branch.
+        required: false
+        type: string
+        default: ai/issue-
+      max_iterations:
+        description: Maximum review/fix iterations.
+        required: false
+        type: number
+        default: 3
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  ai-dev-loop:
+    name: Plan, code, review, and update PR
+    runs-on: ubuntu-latest
+    env:
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+      TRIGGER_COMMENT: ${{ inputs.trigger_comment }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+      MAX_ITERATIONS: ${{ inputs.max_iterations }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      MODEL: gpt-4.1
+      RUNTIME_DIR: ${{ runner.temp }}/ai-dev-loop-runtime
+      ENGINE_DIR: _ai_dev_loop_engine
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Resolve engine repository ref
+        id: engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_ref="${{ github.workflow_ref }}"
+          repository="${workflow_ref%%/.github/workflows/*}"
+          ref="${workflow_ref##*@}"
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout engine prompts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.engine.outputs.repository }}
+          ref: ${{ steps.engine.outputs.ref }}
+          path: ${{ env.ENGINE_DIR }}
+          token: ${{ github.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Prepare fixed issue branch
+        id: branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${BRANCH_PREFIX}${ISSUE_NUMBER}"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+
+          git fetch origin "${BASE_BRANCH}" --prune
+          if git ls-remote --exit-code --heads origin "${branch}" >/dev/null 2>&1; then
+            git fetch origin "${branch}"
+            git checkout -B "${branch}" "origin/${branch}"
+          else
+            git checkout -B "${branch}" "origin/${BASE_BRANCH}"
+            git push -u origin "${branch}"
+          fi
+
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+          npm install -g @openai/codex
+
+      - name: Read issue context
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+            const {owner, repo} = context.repo;
+            const issue = await github.rest.issues.get({owner, repo, issue_number});
+            core.setOutput("title", issue.data.title || "");
+            core.setOutput("body", issue.data.body || "");
+
+      - name: Create helper scripts
+        shell: bash
+        run: |
+          mkdir -p "$RUNTIME_DIR"
+          cat > "$RUNTIME_DIR/openai_call.py" <<'PY'
+          import json
+          import os
+          import sys
+          import requests
+
+          api_key = os.environ["OPENAI_API_KEY"]
+          model = os.environ.get("MODEL", "gpt-4.1")
+          prompt_path, input_path, output_path = sys.argv[1:4]
+
+          with open(prompt_path, "r", encoding="utf-8") as f:
+              system_prompt = f.read()
+          with open(input_path, "r", encoding="utf-8") as f:
+              user_input = f.read()
+
+          payload = {
+              "model": model,
+              "input": [
+                  {"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_input},
+              ],
+          }
+          if output_path.endswith(".json"):
+              payload["text"] = {"format": {"type": "json_object"}}
+
+          response = requests.post(
+              "https://api.openai.com/v1/responses",
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              json=payload,
+              timeout=180,
+          )
+          response.raise_for_status()
+          data = response.json()
+          text = data.get("output_text")
+          if text is None:
+              parts = []
+              for item in data.get("output", []):
+                  for content in item.get("content", []):
+                      if content.get("type") in ("output_text", "text"):
+                          parts.append(content.get("text", ""))
+              text = "\n".join(parts).strip()
+          with open(output_path, "w", encoding="utf-8") as f:
+              f.write(text or "")
+          PY
+
+      - name: Generate initial plan
+        shell: bash
+        env:
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.body }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNTIME_DIR/planner-input.md" <<EOF
+          # Issue
+
+          Number: ${ISSUE_NUMBER}
+
+          Title:
+          ${ISSUE_TITLE}
+
+          Body:
+          ${ISSUE_BODY}
+
+          Trigger comment:
+          ${TRIGGER_COMMENT}
+          EOF
+          python "$RUNTIME_DIR/openai_call.py" \
+            "$ENGINE_DIR/.github/ai/prompts/planner.md" \
+            "$RUNTIME_DIR/planner-input.md" \
+            plan.md
+
+      - name: Commit plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add plan.md
+          if git diff --cached --quiet; then
+            echo "No plan changes to commit."
+          else
+            git commit -m "Add AI implementation plan for issue #${ISSUE_NUMBER}"
+            git push origin "${{ steps.branch.outputs.branch }}"
+          fi
+
+      - name: Create or update pull request
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          BRANCH_NAME: ${{ steps.branch.outputs.branch }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const head = `${owner}:${process.env.BRANCH_NAME}`;
+            const pulls = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: "open",
+              head,
+            });
+
+            const title = `AI dev loop for issue #${process.env.ISSUE_NUMBER}`;
+            const body = [
+              `Automated implementation branch for #${process.env.ISSUE_NUMBER}.`,
+              "",
+              "This PR is continuously updated for the same issue branch.",
+              "",
+              "Auto-merge is intentionally disabled.",
+            ].join("\n");
+
+            let pr;
+            if (pulls.data.length > 0) {
+              pr = pulls.data[0];
+              await github.rest.pulls.update({owner, repo, pull_number: pr.number, title, body});
+            } else {
+              pr = (await github.rest.pulls.create({
+                owner,
+                repo,
+                title,
+                body,
+                head: process.env.BRANCH_NAME,
+                base: process.env.BASE_BRANCH,
+                maintainer_can_modify: true,
+              })).data;
+            }
+            core.setOutput("number", String(pr.number));
+            core.setOutput("html_url", pr.html_url);
+
+      - name: Run implementation and review loop
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          BRANCH_NAME: ${{ steps.branch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          max="${MAX_ITERATIONS:-3}"
+          if [ "$max" -lt 1 ]; then
+            max=1
+          fi
+
+          for iteration in $(seq 1 "$max"); do
+            echo "Starting iteration ${iteration}/${max}"
+
+            cat "$ENGINE_DIR/.github/ai/prompts/coder.md" plan.md > "$RUNTIME_DIR/coder-instructions.md"
+            codex exec --full-auto --dangerously-bypass-approvals-and-sandbox \
+              --prompt-file "$RUNTIME_DIR/coder-instructions.md"
+
+            git status --short
+            if [ -n "$(git status --porcelain --untracked-files=all -- . ":(exclude)$ENGINE_DIR")" ]; then
+              git add -A -- . ":(exclude)$ENGINE_DIR"
+              git commit -m "Apply AI plan for issue #${ISSUE_NUMBER} (iteration ${iteration})"
+              git push origin "${BRANCH_NAME}"
+            else
+              echo "Codex produced no working tree changes."
+            fi
+
+            git fetch origin "${BASE_BRANCH}" --prune
+            git diff --name-only "origin/${BASE_BRANCH}...HEAD" > "$RUNTIME_DIR/changed-files.txt"
+            git diff --find-renames "origin/${BASE_BRANCH}...HEAD" > "$RUNTIME_DIR/diff.patch"
+
+            cat > "$RUNTIME_DIR/reviewer-input.md" <<EOF
+          # plan.md
+
+          $(cat plan.md)
+
+          # Changed files
+
+          $(cat "$RUNTIME_DIR/changed-files.txt")
+
+          # Git diff
+
+          $(cat "$RUNTIME_DIR/diff.patch")
+          EOF
+
+            python "$RUNTIME_DIR/openai_call.py" \
+              "$ENGINE_DIR/.github/ai/prompts/reviewer.md" \
+              "$RUNTIME_DIR/reviewer-input.md" \
+              "$RUNTIME_DIR/review.json"
+
+            python -m json.tool "$RUNTIME_DIR/review.json" > "$RUNTIME_DIR/review.pretty.json"
+            cat "$RUNTIME_DIR/review.pretty.json"
+
+            status="$(python - <<'PY'
+          import json
+          import os
+          with open(os.path.join(os.environ["RUNTIME_DIR"], "review.json"), "r", encoding="utf-8") as f:
+              print(json.load(f).get("status", "needs_changes"))
+          PY
+          )"
+
+            if [ "$status" = "pass" ]; then
+              echo "Review passed."
+              break
+            fi
+
+            if [ "$iteration" -ge "$max" ]; then
+              echo "Review still needs changes after ${max} iterations."
+              exit 1
+            fi
+
+            cat > "$RUNTIME_DIR/replan-input.md" <<EOF
+          # Previous plan.md
+
+          $(cat plan.md)
+
+          # Reviewer JSON
+
+          $(cat "$RUNTIME_DIR/review.pretty.json")
+
+          Generate a revised plan.md that keeps the original issue scope and fixes only the reviewer findings.
+          EOF
+
+            python "$RUNTIME_DIR/openai_call.py" \
+              "$ENGINE_DIR/.github/ai/prompts/planner.md" \
+              "$RUNTIME_DIR/replan-input.md" \
+              plan.md
+
+            git add plan.md
+            if git diff --cached --quiet; then
+              echo "No revised plan changes to commit."
+            else
+              git commit -m "Revise AI plan for issue #${ISSUE_NUMBER} (iteration ${iteration})"
+              git push origin "${BRANCH_NAME}"
+            fi
+          done
+
+      - name: Comment with PR result
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.html_url }}
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const body = [
+              `AI dev loop finished with status: ${process.env.JOB_STATUS}.`,
+              "",
+              `PR: ${process.env.PR_URL || `#${process.env.PR_NUMBER}`}`,
+              "",
+              "No automatic merge was attempted.",
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: Number(process.env.ISSUE_NUMBER),
+              body,
+            });
