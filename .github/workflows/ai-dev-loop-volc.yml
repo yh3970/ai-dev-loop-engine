@@ -24,12 +24,12 @@ on:
         type: string
         default: ai/issue-
       engine_repository:
-        description: Kept for compatibility with the OpenAI/Codex workflow.
+        description: Kept for compatibility with the original workflow.
         required: false
         type: string
         default: yh3970/ai-dev-loop-engine
       engine_ref:
-        description: Kept for compatibility with the OpenAI/Codex workflow.
+        description: Kept for compatibility with the original workflow.
         required: false
         type: string
         default: main
@@ -64,7 +64,7 @@ on:
         type: string
         default: .
       max_iterations:
-        description: Kept for compatibility; this lightweight workflow performs one implementation pass.
+        description: Kept for compatibility; this workflow performs one lightweight implementation pass.
         required: false
         type: number
         default: 1
@@ -170,8 +170,8 @@ jobs:
           api_key = os.environ["ARK_API_KEY"]
           model = os.environ.get("MODEL", "doubao-seed-evolving")
           base_url = os.environ.get("VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
-          retry_statuses = {429, 500, 502, 503, 504}
-          backoff_seconds = [10, 20, 40, 80, 120]
+          retry_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+          backoff_seconds = [15, 30, 60, 90, 120]
           payload = {
               "model": model,
               "input": [
@@ -188,15 +188,24 @@ jobs:
           }
           response = None
           for attempt in range(1, 6):
-              response = requests.post(
-                  f"{base_url}/responses",
-                  headers={
-                      "Authorization": f"Bearer {api_key}",
-                      "Content-Type": "application/json",
-                  },
-                  json=payload,
-                  timeout=180,
-              )
+              try:
+                  response = requests.post(
+                      f"{base_url}/responses",
+                      headers={
+                          "Authorization": f"Bearer {api_key}",
+                          "Content-Type": "application/json",
+                      },
+                      json=payload,
+                      timeout=600,
+                  )
+              except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                  if attempt == 5:
+                      raise
+                  wait = backoff_seconds[attempt - 1] + random.uniform(0, 2)
+                  print(f"Ark API request error {type(exc).__name__}; retrying in {wait:.1f}s, attempt {attempt + 1}/5", file=sys.stderr)
+                  time.sleep(wait)
+                  continue
+
               if response.status_code not in retry_statuses:
                   response.raise_for_status()
                   break
@@ -212,6 +221,8 @@ jobs:
               print(f"Ark API returned {response.status_code}; retrying in {wait:.1f}s, attempt {attempt + 1}/5", file=sys.stderr)
               time.sleep(wait)
 
+          if response is None:
+              raise RuntimeError("No Ark API response was received")
           data = response.json()
           text = data.get("output_text")
           if not text:
@@ -227,7 +238,6 @@ jobs:
 
           cat > "$RUNTIME_DIR/apply_file_edits.py" <<'PY'
           import json
-          import os
           import re
           import sys
           from pathlib import Path
@@ -283,7 +293,7 @@ jobs:
           set -euo pipefail
           cat > "$RUNTIME_DIR/planner-prompt.md" <<'EOF'
           You are a senior software planning assistant. Create a concise implementation plan for the issue.
-          Be specific about files likely to change. Do not write code in this plan.
+          Keep it short. Be specific about files likely to change. Do not write code in this plan.
           EOF
           cat > "$RUNTIME_DIR/planner-input.md" <<EOF
           # Issue
@@ -354,32 +364,70 @@ jobs:
 
       - name: Build repository context
         shell: bash
+        env:
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.body }}
         run: |
           set -euo pipefail
           python - <<'PY'
           import os
           from pathlib import Path
 
+          issue_text = (os.environ.get("ISSUE_TITLE", "") + "\n" + os.environ.get("ISSUE_BODY", "")).lower()
+          plan_path = Path(f".ai-dev/issue-{os.environ['ISSUE_NUMBER']}/plan.md")
+          plan_text = plan_path.read_text(encoding="utf-8").lower() if plan_path.exists() else ""
+          combined = issue_text + "\n" + plan_text
+
+          priority = []
+          if any(word in combined for word in ["readme", "doc", "documentation", "architecture"]):
+              priority.extend(["README.md", "readme.md"])
+          priority.extend([
+              "manifest.json",
+              "background.js",
+              "contentScript.js",
+              "aiSemanticMatcher.js",
+              "options.js",
+              "options.html",
+              "popup.js",
+              "popup.html",
+              "styles.css",
+              "test-agent-application.html",
+              "README.md",
+          ])
+
           allowed = {".md", ".js", ".mjs", ".cjs", ".json", ".html", ".css", ".txt"}
-          max_total = 140000
-          max_file = 24000
-          out = []
-          total = 0
+          selected = []
+          seen = set()
+          for name in priority:
+              p = Path(name)
+              if p.exists() and p.is_file() and str(p) not in seen:
+                  selected.append(p)
+                  seen.add(str(p))
           for p in sorted(Path(".").rglob("*")):
-              if not p.is_file():
-                  continue
               s = str(p)
+              if s in seen or not p.is_file():
+                  continue
               if s.startswith(".git/") or s.startswith(".ai-dev/") or s.startswith("node_modules/"):
                   continue
               if p.suffix not in allowed:
                   continue
+              selected.append(p)
+              seen.add(s)
+              if len(selected) >= 12:
+                  break
+
+          max_total = 50000
+          max_file = 12000
+          out = []
+          total = 0
+          for p in selected:
               try:
                   text = p.read_text(encoding="utf-8")
               except Exception:
                   continue
               if len(text) > max_file:
                   text = text[:max_file] + "\n...[truncated]..."
-              block = f"\n--- FILE: {s} ---\n{text}\n"
+              block = f"\n--- FILE: {p} ---\n{text}\n"
               if total + len(block) > max_total:
                   break
               out.append(block)
@@ -387,6 +435,9 @@ jobs:
           Path(os.environ["RUNTIME_DIR"]).mkdir(parents=True, exist_ok=True)
           Path(os.environ["RUNTIME_DIR"], "repo-context.md").write_text("".join(out), encoding="utf-8")
           print(f"Collected {len(out)} files, {total} characters")
+          print("Files:")
+          for p in selected[:len(out)]:
+              print(f"- {p}")
           PY
 
       - name: Generate file edits
@@ -408,7 +459,7 @@ jobs:
           }
           Rules:
           - Include the full final content for every file you edit.
-          - Prefer minimal changes.
+          - Keep changes minimal and focused on the issue.
           - Do not edit .github/workflows files.
           - Do not include markdown fences or explanations outside the JSON.
           - If only documentation is needed, edit only documentation files.
