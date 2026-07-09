@@ -2,10 +2,12 @@
 
 Reusable GitHub Actions workflow and prompt set for a shared AI development loop.
 
-The intended architecture is:
+This repository is intentionally small: it contains reusable workflow logic, reusable prompts, and validation checks. Business repositories should keep only a tiny trigger workflow that calls this reusable engine.
 
-1. This engine repository contains only reusable workflow logic and AI prompts.
-2. Each business repository, such as a plugin, website, or mini-program, contains only a very small trigger workflow.
+## Target Architecture
+
+1. The engine repository contains reusable workflow logic and prompts.
+2. Each business repository, such as a plugin, website, or mini-program, contains only a small trigger workflow.
 3. A user comments `/aidev` on an issue in the business repository.
 4. GPT reads the issue plus trigger comment and generates a structured plan.
 5. Codex implements only that plan and must not freely expand scope.
@@ -169,6 +171,18 @@ PR behavior is stable:
 - If no open PR exists for that branch, the workflow creates a PR.
 - Reruns, `/aidev continue`, and revised plans keep using the same branch and PR.
 - The workflow does not merge or auto-merge the PR.
+
+## File Format Requirements
+
+The workflow and documentation files must remain normal multi-line text files:
+
+- `.github/workflows/ai-dev-loop.yml` must remain normal multi-line YAML.
+- `.github/workflows/validate.yml` must remain normal multi-line YAML.
+- `README.md` must remain normal multi-line Markdown with copyable code blocks.
+- Files must use LF line endings.
+- Files must not contain hidden or bidirectional Unicode control characters.
+
+The `Validate Workflows` check enforces these requirements on pull requests and manual workflow dispatches.
 
 ## Safety Notes
 

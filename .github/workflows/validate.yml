@@ -1,3 +1,4 @@
+# Validation workflow for repository file-format invariants.
 name: Validate Workflows
 
 on:
@@ -44,6 +45,12 @@ jobs:
           minimum_lines = {
               Path(".github/workflows/ai-dev-loop.yml"): 100,
               Path(".github/workflows/validate.yml"): 30,
+              Path("README.md"): 50,
+          }
+
+          forbidden_collapsed_prefixes = {
+              Path(".github/workflows/ai-dev-loop.yml"): "name: AI Dev Loop on:",
+              Path(".github/workflows/validate.yml"): "name: Validate Workflows" + " on:",
           }
 
           for path in paths:
@@ -60,6 +67,10 @@ jobs:
               line_count = len(path.read_text(encoding="utf-8").splitlines())
               if line_count < minimum:
                   raise SystemExit(f"{path} appears compressed: only {line_count} lines")
+
+          for path, forbidden in forbidden_collapsed_prefixes.items():
+              if forbidden in path.read_text(encoding="utf-8"):
+                  raise SystemExit(f"{path} appears to contain collapsed YAML text: {forbidden}")
 
           workflow = Path(".github/workflows/ai-dev-loop.yml").read_text(encoding="utf-8")
           if "runner.temp" in workflow:
