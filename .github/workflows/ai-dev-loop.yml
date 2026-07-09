@@ -326,6 +326,7 @@ jobs:
               echo "No test_command configured." | tee "$RUNTIME_DIR/test-result.txt"
               test_exit=0
             fi
+
             if [ -n "$(git status --porcelain --untracked-files=all -- . ":(exclude)$ENGINE_DIR")" ]; then
               git add -A -- . ":(exclude)$ENGINE_DIR"
               git commit -m "Apply AI plan for issue #${ISSUE_NUMBER} (iteration ${iteration})"
