@@ -1,0 +1,479 @@
+# Volcengine-only reusable AI development loop workflow.
+name: AI Dev Loop Volcengine
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: Issue number to implement.
+        required: true
+        type: string
+      trigger_comment:
+        description: Comment text that triggered the loop.
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        description: Branch to create the AI work branch from.
+        required: false
+        type: string
+        default: main
+      branch_prefix:
+        description: Prefix for the fixed issue branch.
+        required: false
+        type: string
+        default: ai/issue-
+      engine_repository:
+        description: Kept for compatibility with the OpenAI/Codex workflow.
+        required: false
+        type: string
+        default: yh3970/ai-dev-loop-engine
+      engine_ref:
+        description: Kept for compatibility with the OpenAI/Codex workflow.
+        required: false
+        type: string
+        default: main
+      provider:
+        description: Kept for compatibility. This workflow always uses Volcengine Ark.
+        required: false
+        type: string
+        default: volcengine
+      model:
+        description: Volcengine Ark model ID.
+        required: false
+        type: string
+        default: doubao-seed-evolving
+      volcengine_base_url:
+        description: Volcengine Ark API base URL.
+        required: false
+        type: string
+        default: https://ark.cn-beijing.volces.com/api/v3
+      install_command:
+        description: Optional dependency installation command to run before implementation.
+        required: false
+        type: string
+        default: ""
+      test_command:
+        description: Optional test command to run after generated edits.
+        required: false
+        type: string
+        default: ""
+      working_directory:
+        description: Directory where install and test commands should run.
+        required: false
+        type: string
+        default: .
+      max_iterations:
+        description: Kept for compatibility; this lightweight workflow performs one implementation pass.
+        required: false
+        type: number
+        default: 1
+    secrets:
+      ARK_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: aidev-volc-${{ github.repository }}-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  ai-dev-loop-volc:
+    name: Plan, edit, test, and update PR
+    runs-on: ubuntu-latest
+    env:
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+      TRIGGER_COMMENT: ${{ inputs.trigger_comment }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+      INSTALL_COMMAND: ${{ inputs.install_command }}
+      TEST_COMMAND: ${{ inputs.test_command }}
+      WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      MODEL: ${{ inputs.model }}
+      VOLCENGINE_BASE_URL: ${{ inputs.volcengine_base_url }}
+      ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+    steps:
+      - name: Init runtime env
+        shell: bash
+        run: |
+          echo "RUNTIME_DIR=$RUNNER_TEMP/ai-dev-loop-runtime" >> "$GITHUB_ENV"
+
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Prepare fixed issue branch
+        id: branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${BRANCH_PREFIX}${ISSUE_NUMBER}"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+
+          git fetch origin "${BASE_BRANCH}" --prune
+          if git ls-remote --exit-code --heads origin "${branch}" >/dev/null 2>&1; then
+            git fetch origin "${branch}"
+            git checkout -B "${branch}" "origin/${branch}"
+          else
+            git checkout -B "${branch}" "origin/${BASE_BRANCH}"
+            git push -u origin "${branch}"
+          fi
+
+      - name: Run project install command
+        if: inputs.install_command != ''
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
+
+      - name: Read issue context
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+            const {owner, repo} = context.repo;
+            const issue = await github.rest.issues.get({owner, repo, issue_number});
+            core.setOutput("title", issue.data.title || "");
+            core.setOutput("body", issue.data.body || "");
+
+      - name: Create helper scripts
+        shell: bash
+        run: |
+          mkdir -p "$RUNTIME_DIR"
+          cat > "$RUNTIME_DIR/ark_call.py" <<'PY'
+          import json
+          import os
+          import random
+          import sys
+          import time
+
+          import requests
+
+          prompt_path, input_path, output_path = sys.argv[1:4]
+          with open(prompt_path, "r", encoding="utf-8") as f:
+              prompt = f.read()
+          with open(input_path, "r", encoding="utf-8") as f:
+              user_input = f.read()
+
+          api_key = os.environ["ARK_API_KEY"]
+          model = os.environ.get("MODEL", "doubao-seed-evolving")
+          base_url = os.environ.get("VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+          retry_statuses = {429, 500, 502, 503, 504}
+          backoff_seconds = [10, 20, 40, 80, 120]
+          payload = {
+              "model": model,
+              "input": [
+                  {
+                      "role": "user",
+                      "content": [
+                          {
+                              "type": "input_text",
+                              "text": prompt + "\n\n" + user_input,
+                          }
+                      ],
+                  }
+              ],
+          }
+          response = None
+          for attempt in range(1, 6):
+              response = requests.post(
+                  f"{base_url}/responses",
+                  headers={
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json",
+                  },
+                  json=payload,
+                  timeout=180,
+              )
+              if response.status_code not in retry_statuses:
+                  response.raise_for_status()
+                  break
+              if attempt == 5:
+                  print(f"Ark API failed after 5 attempts with status {response.status_code}: {response.text[:500]}", file=sys.stderr)
+                  response.raise_for_status()
+              retry_after = response.headers.get("Retry-After")
+              try:
+                  wait = float(retry_after) if retry_after else backoff_seconds[attempt - 1]
+              except ValueError:
+                  wait = backoff_seconds[attempt - 1]
+              wait += random.uniform(0, 2)
+              print(f"Ark API returned {response.status_code}; retrying in {wait:.1f}s, attempt {attempt + 1}/5", file=sys.stderr)
+              time.sleep(wait)
+
+          data = response.json()
+          text = data.get("output_text")
+          if not text:
+              parts = []
+              for item in data.get("output", []):
+                  for content in item.get("content", []):
+                      if isinstance(content, dict) and content.get("type") in ("output_text", "text"):
+                          parts.append(str(content.get("text", "")))
+              text = "\n".join(parts).strip()
+          with open(output_path, "w", encoding="utf-8") as f:
+              f.write(text or "")
+          PY
+
+          cat > "$RUNTIME_DIR/apply_file_edits.py" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          raw_path = sys.argv[1]
+          with open(raw_path, "r", encoding="utf-8") as f:
+              raw = f.read().strip()
+
+          fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S)
+          if fence:
+              raw = fence.group(1).strip()
+          start = raw.find("{")
+          end = raw.rfind("}")
+          if start >= 0 and end >= start:
+              raw = raw[start:end + 1]
+
+          data = json.loads(raw)
+          files = data.get("files", [])
+          if not isinstance(files, list) or not files:
+              raise SystemExit("No files were returned in file edit JSON")
+
+          allowed_ext = {
+              ".md", ".js", ".mjs", ".cjs", ".json", ".html", ".css", ".txt", ".yml", ".yaml"
+          }
+          for item in files:
+              path = item.get("path")
+              content = item.get("content")
+              if not isinstance(path, str) or not isinstance(content, str):
+                  raise SystemExit(f"Invalid file edit item: {item!r}")
+              p = Path(path)
+              if p.is_absolute() or ".." in p.parts:
+                  raise SystemExit(f"Unsafe path: {path}")
+              if str(p).startswith(".git/") or str(p).startswith("_ai_dev_loop_engine/"):
+                  raise SystemExit(f"Refusing to edit internal path: {path}")
+              if str(p).startswith(".github/workflows/"):
+                  raise SystemExit(f"Refusing to edit workflow path from generated code: {path}")
+              if p.suffix and p.suffix not in allowed_ext:
+                  raise SystemExit(f"Refusing to edit unsupported file type: {path}")
+              p.parent.mkdir(parents=True, exist_ok=True)
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(content)
+                  if not content.endswith("\n"):
+                      f.write("\n")
+              print(f"Wrote {path}")
+          PY
+
+      - name: Generate plan
+        shell: bash
+        env:
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.body }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNTIME_DIR/planner-prompt.md" <<'EOF'
+          You are a senior software planning assistant. Create a concise implementation plan for the issue.
+          Be specific about files likely to change. Do not write code in this plan.
+          EOF
+          cat > "$RUNTIME_DIR/planner-input.md" <<EOF
+          # Issue
+          Number: ${ISSUE_NUMBER}
+
+          Title:
+          ${ISSUE_TITLE}
+
+          Body:
+          ${ISSUE_BODY}
+
+          Trigger comment:
+          ${TRIGGER_COMMENT}
+          EOF
+          plan_dir=".ai-dev/issue-${ISSUE_NUMBER}"
+          mkdir -p "$plan_dir"
+          python "$RUNTIME_DIR/ark_call.py" "$RUNTIME_DIR/planner-prompt.md" "$RUNTIME_DIR/planner-input.md" "$plan_dir/plan.md"
+
+      - name: Commit plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add ".ai-dev/issue-${ISSUE_NUMBER}/plan.md"
+          if git diff --cached --quiet; then
+            echo "No plan changes to commit."
+          else
+            git commit -m "Add AI implementation plan for issue #${ISSUE_NUMBER}"
+            git push origin "${{ steps.branch.outputs.branch }}"
+          fi
+
+      - name: Create or update pull request
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          BRANCH_NAME: ${{ steps.branch.outputs.branch }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const head = `${owner}:${process.env.BRANCH_NAME}`;
+            const pulls = await github.rest.pulls.list({owner, repo, state: "open", head});
+            const title = `AI dev loop for issue #${process.env.ISSUE_NUMBER}`;
+            const body = [
+              `Automated implementation branch for #${process.env.ISSUE_NUMBER}.`,
+              "",
+              "This PR is generated using Volcengine Ark only; OpenAI Codex CLI is not used.",
+              "",
+              `Plan: \`.ai-dev/issue-${process.env.ISSUE_NUMBER}/plan.md\``,
+              "",
+              "Auto-merge is intentionally disabled; human review is required before merge.",
+            ].join("\n");
+            let pr;
+            if (pulls.data.length > 0) {
+              pr = pulls.data[0];
+              await github.rest.pulls.update({owner, repo, pull_number: pr.number, title, body});
+            } else {
+              pr = (await github.rest.pulls.create({
+                owner,
+                repo,
+                title,
+                body,
+                head: process.env.BRANCH_NAME,
+                base: process.env.BASE_BRANCH,
+                maintainer_can_modify: true,
+              })).data;
+            }
+            core.setOutput("number", String(pr.number));
+            core.setOutput("html_url", pr.html_url);
+
+      - name: Build repository context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          allowed = {".md", ".js", ".mjs", ".cjs", ".json", ".html", ".css", ".txt"}
+          max_total = 140000
+          max_file = 24000
+          out = []
+          total = 0
+          for p in sorted(Path(".").rglob("*")):
+              if not p.is_file():
+                  continue
+              s = str(p)
+              if s.startswith(".git/") or s.startswith(".ai-dev/") or s.startswith("node_modules/"):
+                  continue
+              if p.suffix not in allowed:
+                  continue
+              try:
+                  text = p.read_text(encoding="utf-8")
+              except Exception:
+                  continue
+              if len(text) > max_file:
+                  text = text[:max_file] + "\n...[truncated]..."
+              block = f"\n--- FILE: {s} ---\n{text}\n"
+              if total + len(block) > max_total:
+                  break
+              out.append(block)
+              total += len(block)
+          Path(os.environ["RUNTIME_DIR"]).mkdir(parents=True, exist_ok=True)
+          Path(os.environ["RUNTIME_DIR"], "repo-context.md").write_text("".join(out), encoding="utf-8")
+          print(f"Collected {len(out)} files, {total} characters")
+          PY
+
+      - name: Generate file edits
+        shell: bash
+        env:
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.body }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNTIME_DIR/coder-prompt.md" <<'EOF'
+          You are a careful coding assistant working inside a GitHub Actions job.
+          Implement the requested issue using ONLY the repository context provided.
+          Return ONLY one valid JSON object with this exact shape:
+          {
+            "summary": "brief summary of the changes",
+            "files": [
+              {"path": "relative/path.ext", "content": "complete new file content"}
+            ]
+          }
+          Rules:
+          - Include the full final content for every file you edit.
+          - Prefer minimal changes.
+          - Do not edit .github/workflows files.
+          - Do not include markdown fences or explanations outside the JSON.
+          - If only documentation is needed, edit only documentation files.
+          EOF
+          cat > "$RUNTIME_DIR/coder-input.md" <<EOF
+          # Issue
+          Number: ${ISSUE_NUMBER}
+
+          Title:
+          ${ISSUE_TITLE}
+
+          Body:
+          ${ISSUE_BODY}
+
+          # Plan
+          $(cat ".ai-dev/issue-${ISSUE_NUMBER}/plan.md")
+
+          # Repository context
+          $(cat "$RUNTIME_DIR/repo-context.md")
+          EOF
+          python "$RUNTIME_DIR/ark_call.py" "$RUNTIME_DIR/coder-prompt.md" "$RUNTIME_DIR/coder-input.md" "$RUNTIME_DIR/file-edits.json"
+          python "$RUNTIME_DIR/apply_file_edits.py" "$RUNTIME_DIR/file-edits.json"
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${TEST_COMMAND}" ]; then
+            (cd "$WORKING_DIRECTORY" && bash -lc "$TEST_COMMAND")
+          else
+            echo "No test_command configured."
+          fi
+
+      - name: Commit generated edits
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain --untracked-files=all -- .)" ]; then
+            git add -A
+            git commit -m "Apply Volcengine AI changes for issue #${ISSUE_NUMBER}"
+            git push origin "${{ steps.branch.outputs.branch }}"
+          else
+            echo "No generated changes to commit."
+          fi
+
+      - name: Comment with PR result
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.html_url }}
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const body = [
+              `AI dev loop finished with status: ${process.env.JOB_STATUS}.`,
+              "",
+              `PR: ${process.env.PR_URL || `#${process.env.PR_NUMBER}`}`,
+              "",
+              "Volcengine-only workflow was used. No automatic merge was attempted.",
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: Number(process.env.ISSUE_NUMBER),
+              body,
+            });
