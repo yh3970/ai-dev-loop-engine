@@ -19,8 +19,8 @@ The intended architecture is:
 
 - Reads an issue and the `/aidev` trigger comment from the caller repository.
 - Checks out this engine repository explicitly for reusable prompts.
-- Generates a structured plan at `.ai-dev/issue-<issue_number>/plan.md`.
-- Creates or updates one fixed branch per issue: `ai/issue-<issue_number>` by default.
+- Generates a structured plan at `.ai-dev/issue-${ISSUE_NUMBER}/plan.md`.
+- Creates or updates one fixed branch per issue: `ai/issue-${issue_number}` by default.
 - Creates a PR only when no open PR exists for that issue branch.
 - Reuses the same open PR for reruns, revised plans, and `/aidev continue` comments.
 - Runs Codex against the generated plan only.
@@ -69,16 +69,16 @@ It requires:
 
 - `OPENAI_API_KEY`
 
-The default branch rule is:
+The branch rule is:
 
 ```text
 branch = ${branch_prefix}${issue_number}
 ```
 
-With the recommended defaults, issue `123` uses:
+With the recommended defaults, issue `${issue_number}` uses:
 
 ```text
-ai/issue-123
+ai/issue-${issue_number}
 ```
 
 If that branch already exists, the workflow checks it out and continues. If not, it creates the branch from `base_branch`.
@@ -148,9 +148,9 @@ If review does not pass before `max_iterations`, inspect the PR and then continu
 
 The workflow will create or update:
 
-- branch `ai/issue-<issue_number>`
+- branch `ai/issue-${issue_number}`
 - the same open PR for that branch
-- `.ai-dev/issue-<issue_number>/plan.md` on the issue branch
+- `.ai-dev/issue-${ISSUE_NUMBER}/plan.md` on the issue branch
 
 The same issue always maps to the same branch and PR, so reruns and revised plans do not create duplicate PRs.
 

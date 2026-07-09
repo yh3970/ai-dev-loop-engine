@@ -26,7 +26,6 @@ jobs:
 
           python - <<'PY'
           from pathlib import Path
-          import sys
 
           bidi_chars = {
               "\u061c", "\u200e", "\u200f", "\u202a", "\u202b", "\u202c",
@@ -42,6 +41,11 @@ jobs:
               Path(".github/ai/prompts/reviewer.md"),
           ]
 
+          minimum_lines = {
+              Path(".github/workflows/ai-dev-loop.yml"): 100,
+              Path(".github/workflows/validate.yml"): 30,
+          }
+
           for path in paths:
               data = path.read_bytes()
               if b"\r" in data:
@@ -52,6 +56,11 @@ jobs:
                       if char in bidi_chars:
                           raise SystemExit(f"Hidden bidi Unicode character U+{ord(char):04X} in {path}:{line_number}")
 
+          for path, minimum in minimum_lines.items():
+              line_count = len(path.read_text(encoding="utf-8").splitlines())
+              if line_count < minimum:
+                  raise SystemExit(f"{path} appears compressed: only {line_count} lines")
+
           workflow = Path(".github/workflows/ai-dev-loop.yml").read_text(encoding="utf-8")
           if "runner.temp" in workflow:
               raise SystemExit("Do not use runner.temp in ai-dev-loop job env; use RUNNER_TEMP in Init runtime env step")
@@ -59,9 +68,18 @@ jobs:
               raise SystemExit("Missing required RUNTIME_DIR initialization via RUNNER_TEMP")
 
           readme = Path("README.md").read_text(encoding="utf-8")
-          expected = "yh3970/ai-dev-loop-engine/.github/workflows/ai-dev-loop.yml@main"
-          if expected not in readme:
-              raise SystemExit(f"README reusable workflow example must include {expected}")
+          required_readme_text = [
+              "yh3970/ai-dev-loop-engine/.github/workflows/ai-dev-loop.yml@main",
+              ".ai-dev/issue-${ISSUE_NUMBER}/plan.md",
+              "${branch_prefix}${issue_number}",
+              "ai/issue-${issue_number}",
+              "${{ github.event.issue.number }}",
+              "${{ github.event.comment.body }}",
+              "${{ secrets.OPENAI_API_KEY }}",
+          ]
+          for expected in required_readme_text:
+              if expected not in readme:
+                  raise SystemExit(f"README must preserve literal text: {expected}")
 
           print("repository validation passed")
           PY
