@@ -1,0 +1,96 @@
+# Validation workflow for repository file-format invariants.
+name: Validate Workflows
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate workflow files and docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate YAML and repository invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ruby -e 'require "yaml"; ARGV.each { |path| YAML.load_file(path); puts "parsed #{path}" }' \
+            .github/workflows/ai-dev-loop.yml \
+            .github/workflows/validate.yml
+
+          python - <<'PY'
+          from pathlib import Path
+
+          bidi_chars = {
+              "\u061c", "\u200e", "\u200f", "\u202a", "\u202b", "\u202c",
+              "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069",
+          }
+
+          paths = [
+              Path(".github/workflows/ai-dev-loop.yml"),
+              Path(".github/workflows/validate.yml"),
+              Path("README.md"),
+              Path(".github/ai/prompts/planner.md"),
+              Path(".github/ai/prompts/coder.md"),
+              Path(".github/ai/prompts/reviewer.md"),
+          ]
+
+          minimum_lines = {
+              Path(".github/workflows/ai-dev-loop.yml"): 100,
+              Path(".github/workflows/validate.yml"): 30,
+              Path("README.md"): 50,
+          }
+
+          forbidden_collapsed_prefixes = {
+              Path(".github/workflows/ai-dev-loop.yml"): "name: AI Dev Loop on:",
+              Path(".github/workflows/validate.yml"): "name: Validate Workflows" + " on:",
+          }
+
+          for path in paths:
+              data = path.read_bytes()
+              if b"\r" in data:
+                  raise SystemExit(f"CRLF or CR line ending found in {path}")
+              text = data.decode("utf-8")
+              for line_number, line in enumerate(text.splitlines(), start=1):
+                  for char in line:
+                      if char in bidi_chars:
+                          raise SystemExit(f"Hidden bidi Unicode character U+{ord(char):04X} in {path}:{line_number}")
+
+          for path, minimum in minimum_lines.items():
+              line_count = len(path.read_text(encoding="utf-8").splitlines())
+              if line_count < minimum:
+                  raise SystemExit(f"{path} appears compressed: only {line_count} lines")
+
+          for path, forbidden in forbidden_collapsed_prefixes.items():
+              if forbidden in path.read_text(encoding="utf-8"):
+                  raise SystemExit(f"{path} appears to contain collapsed YAML text: {forbidden}")
+
+          workflow = Path(".github/workflows/ai-dev-loop.yml").read_text(encoding="utf-8")
+          if "runner.temp" in workflow:
+              raise SystemExit("Do not use runner.temp in ai-dev-loop job env; use RUNNER_TEMP in Init runtime env step")
+          if "RUNTIME_DIR=$RUNNER_TEMP/ai-dev-loop-runtime" not in workflow:
+              raise SystemExit("Missing required RUNTIME_DIR initialization via RUNNER_TEMP")
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          required_readme_text = [
+              "yh3970/ai-dev-loop-engine/.github/workflows/ai-dev-loop.yml@main",
+              ".ai-dev/issue-${ISSUE_NUMBER}/plan.md",
+              "${branch_prefix}${issue_number}",
+              "ai/issue-${issue_number}",
+              "${{ github.event.issue.number }}",
+              "${{ github.event.comment.body }}",
+              "${{ secrets.OPENAI_API_KEY }}",
+          ]
+          for expected in required_readme_text:
+              if expected not in readme:
+                  raise SystemExit(f"README must preserve literal text: {expected}")
+
+          print("repository validation passed")
+          PY

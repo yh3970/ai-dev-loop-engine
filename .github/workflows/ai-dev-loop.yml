@@ -1,3 +1,4 @@
+# Reusable AI development loop workflow.
 name: AI Dev Loop
 
 on:
@@ -22,8 +23,38 @@ on:
         required: false
         type: string
         default: ai/issue-
+      engine_repository:
+        description: Repository that contains reusable prompts and workflow assets.
+        required: false
+        type: string
+        default: yh3970/ai-dev-loop-engine
+      engine_ref:
+        description: Git ref to checkout from the engine repository.
+        required: false
+        type: string
+        default: main
+      model:
+        description: OpenAI model used for planning and review.
+        required: false
+        type: string
+        default: gpt-4.1
+      install_command:
+        description: Optional dependency installation command to run before implementation.
+        required: false
+        type: string
+        default: ""
+      test_command:
+        description: Optional test command to run after each Codex implementation attempt.
+        required: false
+        type: string
+        default: ""
+      working_directory:
+        description: Directory where install and test commands should run.
+        required: false
+        type: string
+        default: .
       max_iterations:
-        description: Maximum review/fix iterations.
+        description: Maximum review/fix iterations for a single workflow run.
         required: false
         type: number
         default: 3
@@ -36,6 +67,10 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: aidev-${{ github.repository }}-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
 jobs:
   ai-dev-loop:
     name: Plan, code, review, and update PR
@@ -46,33 +81,29 @@ jobs:
       BASE_BRANCH: ${{ inputs.base_branch }}
       BRANCH_PREFIX: ${{ inputs.branch_prefix }}
       MAX_ITERATIONS: ${{ inputs.max_iterations }}
+      INSTALL_COMMAND: ${{ inputs.install_command }}
+      TEST_COMMAND: ${{ inputs.test_command }}
+      WORKING_DIRECTORY: ${{ inputs.working_directory }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      MODEL: gpt-4.1
-      RUNTIME_DIR: ${{ runner.temp }}/ai-dev-loop-runtime
+      MODEL: ${{ inputs.model }}
       ENGINE_DIR: _ai_dev_loop_engine
     steps:
+      - name: Init runtime env
+        shell: bash
+        run: |
+          echo "RUNTIME_DIR=$RUNNER_TEMP/ai-dev-loop-runtime" >> "$GITHUB_ENV"
+
       - name: Checkout caller repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ github.token }}
 
-      - name: Resolve engine repository ref
-        id: engine
-        shell: bash
-        run: |
-          set -euo pipefail
-          workflow_ref="${{ github.workflow_ref }}"
-          repository="${workflow_ref%%/.github/workflows/*}"
-          ref="${workflow_ref##*@}"
-          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
-
       - name: Checkout engine prompts
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.engine.outputs.repository }}
-          ref: ${{ steps.engine.outputs.ref }}
+          repository: ${{ inputs.engine_repository }}
+          ref: ${{ inputs.engine_ref }}
           path: ${{ env.ENGINE_DIR }}
           token: ${{ github.token }}
 
@@ -104,6 +135,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests
           npm install -g @openai/codex
+
+      - name: Run project install command
+        if: inputs.install_command != ''
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
 
       - name: Read issue context
         id: issue
@@ -189,16 +226,18 @@ jobs:
           Trigger comment:
           ${TRIGGER_COMMENT}
           EOF
+          plan_dir=".ai-dev/issue-${ISSUE_NUMBER}"
+          mkdir -p "$plan_dir"
           python "$RUNTIME_DIR/openai_call.py" \
             "$ENGINE_DIR/.github/ai/prompts/planner.md" \
             "$RUNTIME_DIR/planner-input.md" \
-            plan.md
+            "$plan_dir/plan.md"
 
       - name: Commit plan
         shell: bash
         run: |
           set -euo pipefail
-          git add plan.md
+          git add ".ai-dev/issue-${ISSUE_NUMBER}/plan.md"
           if git diff --cached --quiet; then
             echo "No plan changes to commit."
           else
@@ -228,7 +267,9 @@ jobs:
               "",
               "This PR is continuously updated for the same issue branch.",
               "",
-              "Auto-merge is intentionally disabled.",
+              `Plan: \`.ai-dev/issue-${process.env.ISSUE_NUMBER}/plan.md\``,
+              "",
+              "Auto-merge is intentionally disabled; human review is required before merge.",
             ].join("\n");
 
             let pr;
@@ -264,11 +305,29 @@ jobs:
           for iteration in $(seq 1 "$max"); do
             echo "Starting iteration ${iteration}/${max}"
 
-            cat "$ENGINE_DIR/.github/ai/prompts/coder.md" plan.md > "$RUNTIME_DIR/coder-instructions.md"
+            plan_path=".ai-dev/issue-${ISSUE_NUMBER}/plan.md"
+            {
+              cat "$ENGINE_DIR/.github/ai/prompts/coder.md"
+              printf '\n# Current plan path\n%s\n' "$plan_path"
+              printf '\n# Working directory for project commands\n%s\n' "$WORKING_DIRECTORY"
+              cat "$plan_path"
+            } > "$RUNTIME_DIR/coder-instructions.md"
             codex exec --full-auto --dangerously-bypass-approvals-and-sandbox \
               --prompt-file "$RUNTIME_DIR/coder-instructions.md"
 
-            git status --short
+            git status | tee "$RUNTIME_DIR/git-status.txt"
+
+            if [ -n "${TEST_COMMAND}" ]; then
+              set +e
+              (cd "$WORKING_DIRECTORY" && bash -lc "$TEST_COMMAND") 2>&1 | tee "$RUNTIME_DIR/test-result.txt"
+              test_exit=${PIPESTATUS[0]}
+              set -e
+              echo "test_exit=${test_exit}" >> "$RUNTIME_DIR/test-result.txt"
+            else
+              echo "No test_command configured." | tee "$RUNTIME_DIR/test-result.txt"
+              test_exit=0
+            fi
+
             if [ -n "$(git status --porcelain --untracked-files=all -- . ":(exclude)$ENGINE_DIR")" ]; then
               git add -A -- . ":(exclude)$ENGINE_DIR"
               git commit -m "Apply AI plan for issue #${ISSUE_NUMBER} (iteration ${iteration})"
@@ -284,7 +343,7 @@ jobs:
             cat > "$RUNTIME_DIR/reviewer-input.md" <<EOF
           # plan.md
 
-          $(cat plan.md)
+          $(cat ".ai-dev/issue-${ISSUE_NUMBER}/plan.md")
 
           # Changed files
 
@@ -293,6 +352,10 @@ jobs:
           # Git diff
 
           $(cat "$RUNTIME_DIR/diff.patch")
+
+          # Test result
+
+          $(cat "$RUNTIME_DIR/test-result.txt")
           EOF
 
             python "$RUNTIME_DIR/openai_call.py" \
@@ -324,7 +387,7 @@ jobs:
             cat > "$RUNTIME_DIR/replan-input.md" <<EOF
           # Previous plan.md
 
-          $(cat plan.md)
+          $(cat ".ai-dev/issue-${ISSUE_NUMBER}/plan.md")
 
           # Reviewer JSON
 
@@ -336,9 +399,9 @@ jobs:
             python "$RUNTIME_DIR/openai_call.py" \
               "$ENGINE_DIR/.github/ai/prompts/planner.md" \
               "$RUNTIME_DIR/replan-input.md" \
-              plan.md
+              ".ai-dev/issue-${ISSUE_NUMBER}/plan.md"
 
-            git add plan.md
+            git add ".ai-dev/issue-${ISSUE_NUMBER}/plan.md"
             if git diff --cached --quiet; then
               echo "No revised plan changes to commit."
             else
