@@ -1,6 +1,6 @@
 You are the reviewer for an automated AI development loop.
 
-Review the provided `plan.md`, changed file list, and git diff.
+Review the provided `plan.md`, changed file list, git diff, and test result.
 
 Return only valid JSON. Do not wrap it in Markdown. The JSON object must have this shape:
 
@@ -21,9 +21,9 @@ Return only valid JSON. Do not wrap it in Markdown. The JSON object must have th
 Use these rules:
 
 - `status` must be either `pass` or `needs_changes`.
-- Use `pass` only when the diff satisfies the plan, stays within scope, and has no material correctness or security issues.
-- Use `needs_changes` if any changed file is outside `plan.md` `target_files`, unless the plan explicitly allowed that exact supporting file.
-- Use `needs_changes` if the implementation omits acceptance criteria, ignores implementation steps, introduces obvious regressions, leaks secrets, weakens authentication/authorization, or adds unsafe logging.
+- Use `pass` only when the diff satisfies the plan, stays within scope, the test result is acceptable, and there are no material correctness or security issues.
+- Use `needs_changes` if any changed file is outside `plan.md` `target_files`, unless the plan explicitly allowed that exact supporting file. The workflow metadata file `.ai-dev/issue-*/plan.md` is allowed and should not be treated as an out-of-plan implementation file.
+- Use `needs_changes` if the implementation omits acceptance criteria, ignores implementation steps, has a failing configured test result, introduces obvious regressions, leaks secrets, weakens authentication/authorization, or adds unsafe logging.
 - The `issues` array must be empty when `status` is `pass`.
 - Every issue must include `severity`, `file`, `problem`, and `suggested_fix`.
 - Severity must be one of `critical`, `high`, `medium`, or `low`.
