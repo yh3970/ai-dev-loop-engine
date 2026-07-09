@@ -433,7 +433,7 @@ jobs:
               cat "$plan_path"
             } > "$RUNTIME_DIR/coder-instructions.md"
             codex exec --full-auto --dangerously-bypass-approvals-and-sandbox \
-              --prompt-file "$RUNTIME_DIR/coder-instructions.md"
+              "$(cat "$RUNTIME_DIR/coder-instructions.md")"
 
             git status | tee "$RUNTIME_DIR/git-status.txt"
 
