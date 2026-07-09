@@ -44,7 +44,7 @@ on:
         type: string
         default: gpt-4.1-mini
       volcengine_base_url:
-        description: Volcengine Ark OpenAI-compatible API base URL.
+        description: Volcengine Ark API base URL.
         required: false
         type: string
         default: https://ark.cn-beijing.volces.com/api/v3
@@ -229,6 +229,17 @@ jobs:
                   time.sleep(wait_seconds)
               raise RuntimeError("No LLM response was received")
 
+          def extract_responses_text(data):
+              text = data.get("output_text")
+              if text:
+                  return str(text)
+              parts = []
+              for item in data.get("output", []):
+                  for content in item.get("content", []):
+                      if isinstance(content, dict) and content.get("type") in ("output_text", "text"):
+                          parts.append(str(content.get("text", "")))
+              return "\n".join(parts).strip()
+
           def call_openai():
               api_key = os.environ.get("OPENAI_API_KEY")
               if not api_key:
@@ -252,39 +263,38 @@ jobs:
                   },
                   payload,
               )
-              data = response.json()
-              text = data.get("output_text")
-              if text is None:
-                  parts = []
-                  for item in data.get("output", []):
-                      for content in item.get("content", []):
-                          if content.get("type") in ("output_text", "text"):
-                              parts.append(content.get("text", ""))
-                  text = "\n".join(parts).strip()
-              return text or ""
+              return extract_responses_text(response.json()) or ""
 
           def call_volcengine():
               api_key = os.environ.get("ARK_API_KEY")
               if not api_key:
                   raise RuntimeError("ARK_API_KEY is required when provider=volcengine")
-              ark_model = model or "doubao-seed-1-6-250615"
+              ark_model = model or "doubao-seed-evolving"
               base_url = (os.environ.get("VOLCENGINE_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
-              user_content = user_input
+              combined_input = (
+                  "System instructions:\n"
+                  + system_prompt
+                  + "\n\nUser request:\n"
+                  + user_input
+              )
               if output_path.endswith(".json"):
-                  user_content = (
-                      user_input
-                      + "\n\nReturn only one valid JSON object. Do not include markdown fences, comments, or extra text."
+                  combined_input += (
+                      "\n\nReturn only one valid JSON object. Do not include markdown fences, comments, or extra text."
                   )
+
               payload = {
                   "model": ark_model,
-                  "messages": [
-                      {"role": "system", "content": system_prompt},
-                      {"role": "user", "content": user_content},
+                  "input": [
+                      {
+                          "role": "user",
+                          "content": [
+                              {"type": "input_text", "text": combined_input},
+                          ],
+                      }
                   ],
-                  "temperature": 0.2,
               }
               response = post_with_retry(
-                  f"{base_url}/chat/completions",
+                  f"{base_url}/responses",
                   {
                       "Authorization": f"Bearer {api_key}",
                       "Content-Type": "application/json",
@@ -292,20 +302,17 @@ jobs:
                   payload,
               )
               data = response.json()
+              text = extract_responses_text(data)
+              if text:
+                  return text
               choices = data.get("choices") or []
-              if not choices:
-                  raise RuntimeError(f"Volcengine response did not contain choices: {json.dumps(data)[:500]}")
-              message = choices[0].get("message") or {}
-              content = message.get("content", "")
-              if isinstance(content, list):
-                  parts = []
-                  for item in content:
-                      if isinstance(item, dict):
-                          parts.append(str(item.get("text") or item.get("content") or ""))
-                      else:
-                          parts.append(str(item))
-                  return "\n".join(parts).strip()
-              return str(content).strip()
+              if choices:
+                  message = choices[0].get("message") or {}
+                  content = message.get("content", "")
+                  if isinstance(content, list):
+                      return "\n".join(str(item.get("text") or item.get("content") or item) for item in content).strip()
+                  return str(content).strip()
+              raise RuntimeError(f"Volcengine response did not contain text: {json.dumps(data)[:500]}")
 
           if provider == "openai":
               text = call_openai()
