@@ -33,11 +33,21 @@ on:
         required: false
         type: string
         default: main
+      provider:
+        description: LLM provider. Supported values are openai and volcengine.
+        required: false
+        type: string
+        default: openai
       model:
-        description: OpenAI model used for planning and review.
+        description: LLM model or provider endpoint ID used for planning and review.
         required: false
         type: string
         default: gpt-4.1-mini
+      volcengine_base_url:
+        description: Volcengine Ark OpenAI-compatible API base URL.
+        required: false
+        type: string
+        default: https://ark.cn-beijing.volces.com/api/v3
       install_command:
         description: Optional dependency installation command to run before implementation.
         required: false
@@ -60,7 +70,9 @@ on:
         default: 3
     secrets:
       OPENAI_API_KEY:
-        required: true
+        required: false
+      ARK_API_KEY:
+        required: false
 
 permissions:
   contents: write
@@ -84,8 +96,11 @@ jobs:
       INSTALL_COMMAND: ${{ inputs.install_command }}
       TEST_COMMAND: ${{ inputs.test_command }}
       WORKING_DIRECTORY: ${{ inputs.working_directory }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PROVIDER: ${{ inputs.provider }}
       MODEL: ${{ inputs.model }}
+      VOLCENGINE_BASE_URL: ${{ inputs.volcengine_base_url }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
       ENGINE_DIR: _ai_dev_loop_engine
     steps:
       - name: Init runtime env
@@ -158,7 +173,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNTIME_DIR"
-          cat > "$RUNTIME_DIR/openai_call.py" <<'PY'
+          cat > "$RUNTIME_DIR/llm_call.py" <<'PY'
           import json
           import os
           import random
@@ -167,8 +182,8 @@ jobs:
 
           import requests
 
-          api_key = os.environ["OPENAI_API_KEY"]
-          model = os.environ.get("MODEL", "gpt-4.1-mini")
+          provider = (os.environ.get("PROVIDER") or "openai").strip().lower()
+          model = (os.environ.get("MODEL") or "").strip()
           prompt_path, input_path, output_path = sys.argv[1:4]
 
           with open(prompt_path, "r", encoding="utf-8") as f:
@@ -176,73 +191,129 @@ jobs:
           with open(input_path, "r", encoding="utf-8") as f:
               user_input = f.read()
 
-          payload = {
-              "model": model,
-              "input": [
-                  {"role": "system", "content": system_prompt},
-                  {"role": "user", "content": user_input},
-              ],
-          }
-          if output_path.endswith(".json"):
-              payload["text"] = {"format": {"type": "json_object"}}
-
           retry_statuses = {429, 500, 502, 503, 504}
           backoff_seconds = [10, 20, 40, 80, 120]
           max_attempts = 5
-          response = None
 
-          for attempt in range(1, max_attempts + 1):
-              response = requests.post(
+          def post_with_retry(url, headers, payload):
+              response = None
+              for attempt in range(1, max_attempts + 1):
+                  response = requests.post(url, headers=headers, json=payload, timeout=180)
+                  if response.status_code not in retry_statuses:
+                      response.raise_for_status()
+                      return response
+
+                  if attempt >= max_attempts:
+                      print(
+                          f"LLM API failed after {max_attempts} attempts with "
+                          f"status {response.status_code}: {response.text[:500]}",
+                          file=sys.stderr,
+                      )
+                      response.raise_for_status()
+
+                  retry_after = response.headers.get("Retry-After")
+                  if retry_after:
+                      try:
+                          wait_seconds = float(retry_after)
+                      except ValueError:
+                          wait_seconds = backoff_seconds[attempt - 1]
+                  else:
+                      wait_seconds = backoff_seconds[attempt - 1]
+                  wait_seconds += random.uniform(0, 2)
+
+                  print(
+                      f"LLM API returned {response.status_code}; retrying in "
+                      f"{wait_seconds:.1f}s, attempt {attempt + 1}/{max_attempts}",
+                      file=sys.stderr,
+                  )
+                  time.sleep(wait_seconds)
+              raise RuntimeError("No LLM response was received")
+
+          def call_openai():
+              api_key = os.environ.get("OPENAI_API_KEY")
+              if not api_key:
+                  raise RuntimeError("OPENAI_API_KEY is required when provider=openai")
+              openai_model = model or "gpt-4.1-mini"
+              payload = {
+                  "model": openai_model,
+                  "input": [
+                      {"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_input},
+                  ],
+              }
+              if output_path.endswith(".json"):
+                  payload["text"] = {"format": {"type": "json_object"}}
+
+              response = post_with_retry(
                   "https://api.openai.com/v1/responses",
-                  headers={
+                  {
                       "Authorization": f"Bearer {api_key}",
                       "Content-Type": "application/json",
                   },
-                  json=payload,
-                  timeout=180,
+                  payload,
               )
+              data = response.json()
+              text = data.get("output_text")
+              if text is None:
+                  parts = []
+                  for item in data.get("output", []):
+                      for content in item.get("content", []):
+                          if content.get("type") in ("output_text", "text"):
+                              parts.append(content.get("text", ""))
+                  text = "\n".join(parts).strip()
+              return text or ""
 
-              if response.status_code not in retry_statuses:
-                  response.raise_for_status()
-                  break
-
-              if attempt >= max_attempts:
-                  print(
-                      f"OpenAI API failed after {max_attempts} attempts with "
-                      f"status {response.status_code}: {response.text[:500]}",
-                      file=sys.stderr,
+          def call_volcengine():
+              api_key = os.environ.get("ARK_API_KEY")
+              if not api_key:
+                  raise RuntimeError("ARK_API_KEY is required when provider=volcengine")
+              ark_model = model or "doubao-seed-1-6-250615"
+              base_url = (os.environ.get("VOLCENGINE_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+              user_content = user_input
+              if output_path.endswith(".json"):
+                  user_content = (
+                      user_input
+                      + "\n\nReturn only one valid JSON object. Do not include markdown fences, comments, or extra text."
                   )
-                  response.raise_for_status()
-
-              retry_after = response.headers.get("Retry-After")
-              if retry_after:
-                  try:
-                      wait_seconds = float(retry_after)
-                  except ValueError:
-                      wait_seconds = backoff_seconds[attempt - 1]
-              else:
-                  wait_seconds = backoff_seconds[attempt - 1]
-              wait_seconds += random.uniform(0, 2)
-
-              print(
-                  f"OpenAI API returned {response.status_code}; retrying in "
-                  f"{wait_seconds:.1f}s, attempt {attempt + 1}/{max_attempts}",
-                  file=sys.stderr,
+              payload = {
+                  "model": ark_model,
+                  "messages": [
+                      {"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_content},
+                  ],
+                  "temperature": 0.2,
+              }
+              response = post_with_retry(
+                  f"{base_url}/chat/completions",
+                  {
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json",
+                  },
+                  payload,
               )
-              time.sleep(wait_seconds)
+              data = response.json()
+              choices = data.get("choices") or []
+              if not choices:
+                  raise RuntimeError(f"Volcengine response did not contain choices: {json.dumps(data)[:500]}")
+              message = choices[0].get("message") or {}
+              content = message.get("content", "")
+              if isinstance(content, list):
+                  parts = []
+                  for item in content:
+                      if isinstance(item, dict):
+                          parts.append(str(item.get("text") or item.get("content") or ""))
+                      else:
+                          parts.append(str(item))
+                  return "\n".join(parts).strip()
+              return str(content).strip()
 
-          if response is None:
-              raise RuntimeError("No OpenAI response was received")
+          if provider == "openai":
+              text = call_openai()
+          elif provider in ("volcengine", "ark", "doubao"):
+              text = call_volcengine()
+          else:
+              raise RuntimeError(f"Unsupported provider: {provider}. Supported: openai, volcengine")
 
-          data = response.json()
-          text = data.get("output_text")
-          if text is None:
-              parts = []
-              for item in data.get("output", []):
-                  for content in item.get("content", []):
-                      if content.get("type") in ("output_text", "text"):
-                          parts.append(content.get("text", ""))
-              text = "\n".join(parts).strip()
           with open(output_path, "w", encoding="utf-8") as f:
               f.write(text or "")
           PY
@@ -270,7 +341,7 @@ jobs:
           EOF
           plan_dir=".ai-dev/issue-${ISSUE_NUMBER}"
           mkdir -p "$plan_dir"
-          python "$RUNTIME_DIR/openai_call.py" \
+          python "$RUNTIME_DIR/llm_call.py" \
             "$ENGINE_DIR/.github/ai/prompts/planner.md" \
             "$RUNTIME_DIR/planner-input.md" \
             "$plan_dir/plan.md"
@@ -400,7 +471,7 @@ jobs:
           $(cat "$RUNTIME_DIR/test-result.txt")
           EOF
 
-            python "$RUNTIME_DIR/openai_call.py" \
+            python "$RUNTIME_DIR/llm_call.py" \
               "$ENGINE_DIR/.github/ai/prompts/reviewer.md" \
               "$RUNTIME_DIR/reviewer-input.md" \
               "$RUNTIME_DIR/review.json"
@@ -438,7 +509,7 @@ jobs:
           Generate a revised plan.md that keeps the original issue scope and fixes only the reviewer findings.
           EOF
 
-            python "$RUNTIME_DIR/openai_call.py" \
+            python "$RUNTIME_DIR/llm_call.py" \
               "$ENGINE_DIR/.github/ai/prompts/planner.md" \
               "$RUNTIME_DIR/replan-input.md" \
               ".ai-dev/issue-${ISSUE_NUMBER}/plan.md"
